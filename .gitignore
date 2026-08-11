@@ -1,0 +1,28 @@
+# secrets — never commit
+.env
+*.env
+secrets.json
+.aws/
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.coverage
+*.egg-info/
+dist/
+build/
+
+# macOS / IDE
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# pre-audit codebase — kept locally, not in history
+archive/
+
+# data/ and results/ ARE tracked: the DVOL history snapshot and the
+# trade-level evidence behind the reported numbers belong in the repo
