@@ -56,6 +56,7 @@ sys.path.insert(0, str(ROOT))
 from vrp.delta_testnet import DeltaAPIError, DeltaTestnetClient  # noqa: E402
 from vrp.live_signals import CV, FEE_CFG, fee  # noqa: E402
 from vrp.live_signals import plan_entry, refresh_iv_rank_data, size_plan  # noqa: E402
+import vrp.telegram_notify as tg  # noqa: E402
 
 SYMBOLS = ("BTC", "ETH")
 STATE_DIR = ROOT / "data" / "live_testnet"
@@ -161,6 +162,11 @@ def unwind(client: DeltaTestnetClient, filled: list[dict]):
                              f"{UNWIND_ATTEMPTS} attempts — {e}. A residual position may "
                              f"exist on the testnet account. Check https://demo.delta.exchange "
                              f"manually. Not retrying further this cycle.")
+                    tg.send_alert(
+                        f"Could not unwind *{f['symbol']}* after {UNWIND_ATTEMPTS} attempts.\n"
+                        f"Error: {e}\n"
+                        f"A residual position may exist. Check demo.delta.exchange now."
+                    )
                 else:
                     time.sleep(2 ** attempt)
 
@@ -215,6 +221,8 @@ def try_open(client: DeltaTestnetClient, state: dict, sym: str):
         log.error(f"{sym}: entry construction failed ({e}) — unwinding {len(filled)} filled leg(s)")
         log_event("ABORT", sym=sym, sides=plan["sides"], error=str(e),
                   filled_before_abort=filled)
+        tg.send_error(f"Entry aborted for *{sym}* {plan['sides']}: {e}\n"
+                     f"Unwinding {len(filled)} filled leg(s).")
         unwind(client, filled)
         return
 
@@ -229,6 +237,13 @@ def try_open(client: DeltaTestnetClient, state: dict, sym: str):
     log_event("OPEN", **pos, planned_credit_unit=plan["credit_unit"], entry_iv_rank=round(plan["iv_rank"], 3))
     log.info(f"OPEN {sym} {pos['sides']} lots={lots} real_credit=${pos['credit']:.2f} "
             f"(planned ${plan['credit_unit']*lots*CV[sym]:.2f}) — visible now on demo.delta.exchange")
+    tg.send(
+        f"\U0001f7e2 *OPENED* {sym} {pos['sides']}\n"
+        f"Lots: {lots}  |  Credit: ${pos['credit']:.2f}  |  Fees: ${pos['fees']:.2f}\n"
+        f"IV rank at entry: {plan['iv_rank']:.0%}\n"
+        f"Expiry: {plan['expiry'].date()}\n"
+        f"Legs: {', '.join(l['symbol'] for l in real_legs)}"
+    )
 
 
 def real_leg_cash_effect(client: DeltaTestnetClient, symbol: str, since: datetime) -> float:
@@ -257,6 +272,7 @@ def check_settlements(client: DeltaTestnetClient, state: dict):
                           if float(p.get("size", 0)) != 0}
     except DeltaAPIError as e:
         log.error(f"Could not check exchange positions this cycle: {e}")
+        tg.send_error(f"Could not check exchange positions this cycle: {e}")
         return
     still_open = []
     for p in state["open"]:
@@ -274,6 +290,12 @@ def check_settlements(client: DeltaTestnetClient, state: dict):
                   real_pnl=round(real_pnl, 2), source="delta_wallet_transactions_ledger")
         log.info(f"CLOSE {p['sym']} {p['sides']} real_pnl=${real_pnl:+.2f} "
                 f"(from Delta's own wallet ledger, not an estimate)")
+        emoji = "\U0001f7e2" if real_pnl >= 0 else "\U0001f534"
+        tg.send(
+            f"{emoji} *CLOSED* {p['sym']} {p['sides']}\n"
+            f"Real P&L: ${real_pnl:+.2f} (from Delta's own ledger)\n"
+            f"Held since: {p['entry_ts'][:10]}  |  Expiry: {p['expiry'][:10]}"
+        )
     state["open"] = still_open
 
 
@@ -297,10 +319,53 @@ def run_once():
             try_open(client, state, sym)
         except Exception as e:
             log.error(f"{sym}: unexpected error, skipping this cycle: {e}")
+            tg.send_error(f"{sym}: unexpected error during try_open, skipped this cycle: {e}")
     save_state(state)
     record_equity(state["equity_estimate"])
     log.info(f"cycle done | equity_estimate=${state['equity_estimate']:,.2f} | "
             f"local open positions: {[(p['sym'], p['sides'], p['lots']) for p in state['open']]}")
+
+    if tg.due_for_daily_summary():
+        send_daily_summary(client, state)
+        tg.mark_daily_summary_sent()
+
+
+def send_daily_summary(client: DeltaTestnetClient, state: dict):
+    try:
+        avail, committed = real_usd_balance(client)
+    except Exception:
+        avail, committed = None, None
+
+    since = datetime.now(timezone.utc).timestamp() - 86400
+    opens_24h = closes_24h = 0
+    pnl_24h = 0.0
+    total_trades = total_pnl = 0.0
+    if LOG_FILE.exists():
+        for line in open(LOG_FILE):
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            ts = datetime.fromisoformat(rec["ts_utc"]).timestamp()
+            if rec.get("event") == "OPEN":
+                if ts >= since:
+                    opens_24h += 1
+            elif rec.get("event") == "CLOSE":
+                total_trades += 1
+                total_pnl += rec.get("real_pnl", 0)
+                if ts >= since:
+                    closes_24h += 1
+                    pnl_24h += rec.get("real_pnl", 0)
+
+    lines = ["\U0001f4ca *Daily Summary*"]
+    if avail is not None:
+        lines.append(f"Real balance: ${avail:.2f} available (${committed:.2f} committed to margin)")
+    lines.append(f"Local open positions: {len(state['open'])}")
+    for p in state["open"]:
+        lines.append(f"  • {p['sym']} {p['sides']} x{p['lots']} lots, expiry {p['expiry'][:10]}")
+    lines.append(f"\nLast 24h: {opens_24h} opened, {closes_24h} closed (${pnl_24h:+.2f})")
+    lines.append(f"All-time: {int(total_trades)} closed trades, ${total_pnl:+.2f} total real P&L")
+    tg.send("\n".join(lines))
 
 
 def smoke_test():
@@ -335,8 +400,14 @@ def main():
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--loop", type=int, metavar="SECONDS")
     ap.add_argument("--status", action="store_true")
+    ap.add_argument("--test-telegram", action="store_true", help="send a test message and exit")
     args = ap.parse_args()
 
+    if args.test_telegram:
+        ok = tg.send("\U0001f9ea Test message from live_trade_testnet.py — "
+                     "if you see this, notifications are wired up correctly.")
+        print("sent OK" if ok else "FAILED — check credentials in crypto-backtest/telegram")
+        return
     if args.smoke_test:
         smoke_test()
         return
@@ -354,6 +425,7 @@ def main():
                 run_once()
             except Exception as e:
                 log.error(f"cycle error, will retry next interval: {e}")
+                tg.send_error(f"Cycle-level error, will retry next interval: {e}")
             for _ in range(interval):
                 if stop["flag"]:
                     break
