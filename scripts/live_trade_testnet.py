@@ -272,6 +272,7 @@ def check_settlements(client: DeltaTestnetClient, state: dict):
                           if float(p.get("size", 0)) != 0}
     except DeltaAPIError as e:
         log.error(f"Could not check exchange positions this cycle: {e}")
+        log_event("ERROR", stage="check_settlements", error=str(e))
         tg.send_error(f"Could not check exchange positions this cycle: {e}")
         return
     still_open = []
@@ -319,6 +320,7 @@ def run_once():
             try_open(client, state, sym)
         except Exception as e:
             log.error(f"{sym}: unexpected error, skipping this cycle: {e}")
+            log_event("ERROR", stage="try_open", sym=sym, error=str(e))
             tg.send_error(f"{sym}: unexpected error during try_open, skipped this cycle: {e}")
     save_state(state)
     record_equity(state["equity_estimate"])
@@ -337,9 +339,9 @@ def send_daily_summary(client: DeltaTestnetClient, state: dict):
         avail, committed = None, None
 
     since = datetime.now(timezone.utc).timestamp() - 86400
-    opens_24h = closes_24h = 0
+    opens_24h = closes_24h = errors_24h = 0
     pnl_24h = 0.0
-    total_trades = total_pnl = 0.0
+    total_trades = total_pnl = total_errors = 0
     if LOG_FILE.exists():
         for line in open(LOG_FILE):
             try:
@@ -356,6 +358,10 @@ def send_daily_summary(client: DeltaTestnetClient, state: dict):
                 if ts >= since:
                     closes_24h += 1
                     pnl_24h += rec.get("real_pnl", 0)
+            elif rec.get("event") == "ERROR":
+                total_errors += 1
+                if ts >= since:
+                    errors_24h += 1
 
     lines = ["\U0001f4ca *Daily Summary*"]
     if avail is not None:
@@ -363,8 +369,9 @@ def send_daily_summary(client: DeltaTestnetClient, state: dict):
     lines.append(f"Local open positions: {len(state['open'])}")
     for p in state["open"]:
         lines.append(f"  • {p['sym']} {p['sides']} x{p['lots']} lots, expiry {p['expiry'][:10]}")
-    lines.append(f"\nLast 24h: {opens_24h} opened, {closes_24h} closed (${pnl_24h:+.2f})")
-    lines.append(f"All-time: {int(total_trades)} closed trades, ${total_pnl:+.2f} total real P&L")
+    lines.append(f"\nLast 24h: {opens_24h} opened, {closes_24h} closed (${pnl_24h:+.2f}), {errors_24h} error(s)")
+    lines.append(f"All-time: {int(total_trades)} closed trades, ${total_pnl:+.2f} total real P&L, "
+                 f"{total_errors} error(s) logged")
     tg.send("\n".join(lines))
 
 
@@ -425,6 +432,7 @@ def main():
                 run_once()
             except Exception as e:
                 log.error(f"cycle error, will retry next interval: {e}")
+                log_event("ERROR", stage="cycle", error=str(e))
                 tg.send_error(f"Cycle-level error, will retry next interval: {e}")
             for _ in range(interval):
                 if stop["flag"]:

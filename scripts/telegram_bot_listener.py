@@ -24,6 +24,7 @@ Commands:
   /balance     REAL Delta balance (available + committed margin)
   /positions   REAL Delta open positions, straight from the exchange
   /trades      last 10 closed trades (real P&L, from the wallet ledger)
+  /errors      last 10 logged errors (durable — survives journald rotation)
   /summary     same content as the automatic daily summary, on demand
 
 Usage:
@@ -74,6 +75,7 @@ def cmd_help(_client) -> str:
            "/balance — real Delta balance right now\n"
            "/positions — real Delta open positions right now\n"
            "/trades — last 10 closed trades (real P&L)\n"
+           "/errors — last 10 logged errors\n"
            "/summary — full daily-summary content, on demand")
 
 
@@ -124,6 +126,26 @@ def cmd_trades(_client) -> str:
     return "\n".join(lines)
 
 
+def cmd_errors(_client) -> str:
+    if not LOG_FILE.exists():
+        return "No log yet."
+    errors = []
+    for line in open(LOG_FILE):
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if rec.get("event") == "ERROR":
+            errors.append(rec)
+    if not errors:
+        return "No errors logged. ✅"
+    lines = [f"*Last 10 errors* (of {len(errors)} total):"]
+    for e in errors[-10:]:
+        lines.append(f"⚠️ {e['ts_utc'][:16]} [{e.get('stage', '?')}] "
+                     f"{e.get('sym', '')} {e.get('error', '')[:150]}")
+    return "\n".join(lines)
+
+
 def cmd_summary(client) -> str:
     if not STATE_FILE.exists():
         return "No local state yet."
@@ -138,6 +160,7 @@ COMMANDS = {
     "/balance": cmd_balance,
     "/positions": cmd_positions,
     "/trades": cmd_trades,
+    "/errors": cmd_errors,
     "/summary": cmd_summary,
 }
 
